@@ -1,6 +1,5 @@
 import sqlite3
 import os
-from datetime import datetime
 
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
@@ -17,54 +16,90 @@ def init_db():
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id     INTEGER PRIMARY KEY,
-            username    TEXT,
-            full_name   TEXT,
-            balance     INTEGER DEFAULT 0,
-            referral_code TEXT UNIQUE,
-            referred_by INTEGER,
+            user_id        INTEGER PRIMARY KEY,
+            username       TEXT,
+            full_name      TEXT,
+            balance        INTEGER DEFAULT 0,
+            referral_code  TEXT UNIQUE,
+            referred_by    INTEGER,
             referral_count INTEGER DEFAULT 0,
             referral_rewarded INTEGER DEFAULT 0,
-            joined_at   TEXT DEFAULT (datetime('now'))
+            joined_at      TEXT DEFAULT (datetime('now'))
         )
     """)
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS subscriptions (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     INTEGER,
-            plan_key    TEXT,
-            plan_name   TEXT,
-            plan_size   TEXT,
-            price       INTEGER,
-            status      TEXT DEFAULT 'pending',
-            paid_with   TEXT DEFAULT 'card',
-            created_at  TEXT DEFAULT (datetime('now')),
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id      INTEGER,
+            plan_key     TEXT,
+            plan_name    TEXT,
+            plan_size    TEXT,
+            price        INTEGER,
+            status       TEXT DEFAULT 'pending',
+            paid_with    TEXT DEFAULT 'card',
+            created_at   TEXT DEFAULT (datetime('now')),
             confirmed_at TEXT
         )
     """)
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS payments (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     INTEGER,
-            amount      INTEGER,
-            purpose     TEXT,
-            ref_id      INTEGER,
-            status      TEXT DEFAULT 'pending',
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id         INTEGER,
+            amount          INTEGER,
+            purpose         TEXT,
+            ref_id          INTEGER,
+            status          TEXT DEFAULT 'pending',
             receipt_file_id TEXT,
-            created_at  TEXT DEFAULT (datetime('now')),
-            confirmed_at TEXT
+            created_at      TEXT DEFAULT (datetime('now')),
+            confirmed_at    TEXT
         )
     """)
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS admins (
-            user_id     INTEGER PRIMARY KEY,
-            added_at    TEXT DEFAULT (datetime('now'))
+            user_id  INTEGER PRIMARY KEY,
+            added_at TEXT DEFAULT (datetime('now'))
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS referral_configs (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            config  TEXT NOT NULL,
+            is_used INTEGER DEFAULT 0,
+            used_by INTEGER,
+            used_at TEXT
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+# ─── Settings ────────────────────────────────────────────
+
+def get_setting(key: str, default=None):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key=?", (key,))
+    row = c.fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (key, value))
     conn.commit()
     conn.close()
 
@@ -76,26 +111,33 @@ def get_or_create_user(user_id: int, username: str, full_name: str, referred_by:
     c = conn.cursor()
     c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
+    is_new = False
     if row is None:
         import random, string
         code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
         c.execute(
-            "INSERT INTO users (user_id, username, full_name, referral_code, referred_by) VALUES (?,?,?,?,?)",
+            "INSERT INTO users (user_id,username,full_name,referral_code,referred_by) VALUES (?,?,?,?,?)",
             (user_id, username, full_name, code, referred_by)
         )
         conn.commit()
-        # افزایش شمارنده دعوت‌کننده
+        is_new = True
         if referred_by:
-            c.execute("UPDATE users SET referral_count = referral_count + 1 WHERE user_id=?", (referred_by,))
+            c.execute(
+                "UPDATE users SET referral_count=referral_count+1 WHERE user_id=?",
+                (referred_by,)
+            )
             conn.commit()
         c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
         row = c.fetchone()
     else:
-        # آپدیت اطلاعات
-        c.execute("UPDATE users SET username=?, full_name=? WHERE user_id=?", (username, full_name, user_id))
+        c.execute(
+            "UPDATE users SET username=?,full_name=? WHERE user_id=?",
+            (username, full_name, user_id)
+        )
         conn.commit()
     result = dict(row)
     conn.close()
+    result["_is_new"] = is_new
     return result
 
 
@@ -111,7 +153,7 @@ def get_user(user_id: int):
 def update_balance(user_id: int, delta: int):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (delta, user_id))
+    c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (delta, user_id))
     conn.commit()
     conn.close()
 
@@ -141,22 +183,31 @@ def mark_referral_rewarded(user_id: int):
     conn.close()
 
 
-def get_referral_count(user_id: int) -> int:
+def get_all_users():
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT referral_count FROM users WHERE user_id=?", (user_id,))
-    row = c.fetchone()
+    c.execute("SELECT * FROM users ORDER BY joined_at DESC")
+    rows = [dict(r) for r in c.fetchall()]
     conn.close()
-    return row["referral_count"] if row else 0
+    return rows
+
+
+def get_all_user_ids():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM users")
+    rows = [r["user_id"] for r in c.fetchall()]
+    conn.close()
+    return rows
 
 
 # ─── Subscriptions ───────────────────────────────────────
 
-def create_subscription(user_id: int, plan_key: str, plan_name: str, plan_size: str, price: int, paid_with: str = "card"):
+def create_subscription(user_id, plan_key, plan_name, plan_size, price, paid_with="card"):
     conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO subscriptions (user_id, plan_key, plan_name, plan_size, price, paid_with) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO subscriptions (user_id,plan_key,plan_name,plan_size,price,paid_with) VALUES (?,?,?,?,?,?)",
         (user_id, plan_key, plan_name, plan_size, price, paid_with)
     )
     sub_id = c.lastrowid
@@ -169,7 +220,7 @@ def confirm_subscription(sub_id: int):
     conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "UPDATE subscriptions SET status='confirmed', confirmed_at=datetime('now') WHERE id=?",
+        "UPDATE subscriptions SET status='confirmed',confirmed_at=datetime('now') WHERE id=?",
         (sub_id,)
     )
     conn.commit()
@@ -187,11 +238,11 @@ def get_user_subscriptions(user_id: int):
 
 # ─── Payments ────────────────────────────────────────────
 
-def create_payment(user_id: int, amount: int, purpose: str, ref_id: int = None) -> int:
+def create_payment(user_id, amount, purpose, ref_id=None):
     conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO payments (user_id, amount, purpose, ref_id) VALUES (?,?,?,?)",
+        "INSERT INTO payments (user_id,amount,purpose,ref_id) VALUES (?,?,?,?)",
         (user_id, amount, purpose, ref_id)
     )
     pay_id = c.lastrowid
@@ -200,26 +251,29 @@ def create_payment(user_id: int, amount: int, purpose: str, ref_id: int = None) 
     return pay_id
 
 
-def update_payment_receipt(pay_id: int, file_id: str):
+def update_payment_receipt(pay_id, file_id):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("UPDATE payments SET receipt_file_id=?, status='receipt_received' WHERE id=?", (file_id, pay_id))
+    c.execute(
+        "UPDATE payments SET receipt_file_id=?,status='receipt_received' WHERE id=?",
+        (file_id, pay_id)
+    )
     conn.commit()
     conn.close()
 
 
-def confirm_payment(pay_id: int):
+def confirm_payment(pay_id):
     conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "UPDATE payments SET status='confirmed', confirmed_at=datetime('now') WHERE id=?",
+        "UPDATE payments SET status='confirmed',confirmed_at=datetime('now') WHERE id=?",
         (pay_id,)
     )
     conn.commit()
     conn.close()
 
 
-def cancel_payment(pay_id: int):
+def cancel_payment(pay_id):
     conn = get_conn()
     c = conn.cursor()
     c.execute("UPDATE payments SET status='cancelled' WHERE id=?", (pay_id,))
@@ -227,7 +281,7 @@ def cancel_payment(pay_id: int):
     conn.close()
 
 
-def get_payment(pay_id: int):
+def get_payment(pay_id):
     conn = get_conn()
     c = conn.cursor()
     c.execute("SELECT * FROM payments WHERE id=?", (pay_id,))
@@ -240,8 +294,8 @@ def get_all_pending_payments():
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        SELECT p.*, u.username, u.full_name 
-        FROM payments p JOIN users u ON p.user_id = u.user_id
+        SELECT p.*, u.username, u.full_name
+        FROM payments p JOIN users u ON p.user_id=u.user_id
         WHERE p.status='receipt_received'
         ORDER BY p.created_at DESC
     """)
@@ -252,7 +306,7 @@ def get_all_pending_payments():
 
 # ─── Admins ──────────────────────────────────────────────
 
-def add_admin(user_id: int):
+def add_admin(user_id):
     conn = get_conn()
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,))
@@ -260,7 +314,7 @@ def add_admin(user_id: int):
     conn.close()
 
 
-def remove_admin(user_id: int):
+def remove_admin(user_id):
     conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
@@ -277,10 +331,38 @@ def get_admin_ids():
     return rows
 
 
-def get_all_users():
+# ─── Referral Configs ─────────────────────────────────────
+
+def add_referral_configs(configs: list):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT * FROM users ORDER BY joined_at DESC")
-    rows = [dict(r) for r in c.fetchall()]
+    for cfg in configs:
+        c.execute("INSERT INTO referral_configs (config) VALUES (?)", (cfg.strip(),))
+    conn.commit()
     conn.close()
-    return rows
+
+
+def get_referral_config_count():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) as cnt FROM referral_configs WHERE is_used=0")
+    row = c.fetchone()
+    conn.close()
+    return row["cnt"] if row else 0
+
+
+def assign_referral_config(user_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM referral_configs WHERE is_used=0 ORDER BY id ASC LIMIT 1")
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return None
+    c.execute(
+        "UPDATE referral_configs SET is_used=1,used_by=?,used_at=datetime('now') WHERE id=?",
+        (user_id, row["id"])
+    )
+    conn.commit()
+    conn.close()
+    return row["config"]
