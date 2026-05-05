@@ -1,103 +1,119 @@
-import time
-from config import *
 from db import *
+from config import *
 from keyboards import *
 
-
-# START + REF
+# START
 async def start(update, context):
     uid = update.message.from_user.id
-
-    ref = None
-    if context.args:
-        try:
-            ref = int(context.args[0])
-        except:
-            pass
-
     get_user(uid)
-    set_ref(uid, ref)
 
-    await update.message.reply_text("🚀 خوش آمدید", reply_markup=menu())
+    await update.message.reply_text(
+        "🚀 خوش اومدی به ربات فروش",
+        reply_markup=main_menu()
+    )
 
 
-# CALLBACKS
+# CALLBACK
 async def handler(update, context):
     q = update.callback_query
     await q.answer()
+
     uid = q.from_user.id
     data = q.data
-
     user = get_user(uid)
 
-    # MENU
+    # خرید
     if data == "buy":
         await q.message.edit_text("📦 انتخاب پلن:", reply_markup=plans())
 
-    elif data == "back":
-        await q.message.edit_text("🏠 منو", reply_markup=menu())
-
-    # PLANS
+    # پلن‌ها
     elif data == "p1":
-        add_order(uid, "1GB سبز نت", 350000, "sub")
-        await q.message.edit_text("🧾 فاکتور:\nهیچ کدام از اشتراک ها دارای مدت زمان نیستند", reply_markup=confirm())
+        add_order(uid, "1 گیگ اینترنت سبز نت", 350000)
+        await q.message.edit_text(
+            "🧾 فاکتور\n\nهیچ کدام از اشتراک ها دارای مدت زمان نیستند",
+            reply_markup=confirm()
+        )
 
     elif data == "p2":
-        add_order(uid, "2GB سبز نت", 650000, "sub")
-        await q.message.edit_text("🧾 فاکتور:\nهیچ کدام از اشتراک ها دارای مدت زمان نیستند", reply_markup=confirm())
-
-    # TEST
-    elif data == "test":
-        await q.message.edit_text("🎁 تست:\n50MB\n100MB")
-
-    # CONFIRM
-    elif data == "confirm":
-        order = last_order(uid)
-        set_expire(uid, int(time.time()) + PAY_TIMEOUT)
-
+        add_order(uid, "2 گیگ اینترنت سبز نت", 650000)
         await q.message.edit_text(
-            f"💳 کارت:\n{CARD_NUMBER}\n\n⏳ 20 دقیقه فرصت دارید"
+            "🧾 فاکتور\n\nهیچ کدام از اشتراک ها دارای مدت زمان نیستند",
+            reply_markup=confirm()
+        )
+
+    # تایید
+    elif data == "confirm":
+        await q.message.edit_text(
+            f"💳 شماره کارت:\n{CARD_NUMBER}\n\n📸 رسید بفرست",
+            reply_markup=back()
         )
 
     elif data == "cancel":
-        await q.message.edit_text("❌ لغو شد", reply_markup=menu())
+        await q.message.edit_text("❌ لغو شد", reply_markup=main_menu())
 
-    # WALLET
-    elif data == "wallet":
-        await q.message.edit_text(f"💰 موجودی: {user[1]}", reply_markup=wallet_menu())
-
-    # REF
-    elif data == "ref":
+    # تست
+    elif data == "test":
+        add_order(uid, "50MB تست", 45000)
         await q.message.edit_text(
-            f"👥 رفرال شما\n\n🔗 لینک:\nhttps://t.me/YOURBOT?start={uid}\n\n👤 تعداد: {user[3]}"
+            "🧾 تست\nمدت زمان ۱۰ روز",
+            reply_markup=confirm()
         )
 
-        if user[3] >= REF_REWARD_COUNT:
-            await context.bot.send_message(ADMIN_ID, f"🎁 کاربر {uid} 5 رفرال گرفت")
-            await context.bot.send_message(uid, "🎉 جایزه شما ثبت شد")
+    # کیف پول
+    elif data == "wallet":
+        await q.message.edit_text(
+            f"💰 موجودی: {user[1]}",
+            reply_markup=back()
+        )
 
-    # ME
+    # حساب
     elif data == "me":
         await q.message.edit_text(
-            f"👤 حساب\n\n💰 موجودی: {user[1]}\n👥 دعوت: {user[3]}"
+            f"👤 حساب شما\n\n💰 موجودی: {user[1]}\n👥 دعوت: {user[2]}",
+            reply_markup=back()
         )
 
-    # SUPPORT
+    # رفرال
+    elif data == "ref":
+        await q.message.edit_text(
+            f"👥 لینک دعوت:\nhttps://t.me/YOURBOT?start={uid}",
+            reply_markup=back()
+        )
+
+    # پشتیبانی
     elif data == "support":
-        await q.message.edit_text("🧑‍💬 پیام خود را بفرستید")
+        context.user_data["support"] = True
+        await q.message.edit_text("🧑‍💬 پیام خود را ارسال کن", reply_markup=back())
+
+    elif data == "back":
+        await q.message.edit_text("🏠 منو", reply_markup=main_menu())
 
 
-# PAYMENT (simplified)
-async def photo(update, context):
+# پیام‌ها
+async def text_handler(update, context):
     uid = update.message.from_user.id
-    order = last_order(uid)
 
-    if order:
-        pay(uid)
-
+    if context.user_data.get("support"):
         await context.bot.send_message(
             ADMIN_ID,
-            f"📥 پرداخت\nUser:{uid}\nPlan:{order[2]}\nPrice:{order[3]}"
+            f"📩 پیام پشتیبانی\nUser:{uid}\n\n{update.message.text}"
+        )
+        await update.message.reply_text("✅ ارسال شد")
+        context.user_data["support"] = False
+
+
+# رسید
+async def photo(update, context):
+    uid = update.message.from_user.id
+    order = get_last_order(uid)
+
+    if order:
+        pay_order(uid)
+
+        await context.bot.send_photo(
+            ADMIN_ID,
+            update.message.photo[-1].file_id,
+            caption=f"💰 پرداخت\nUser:{uid}\nPlan:{order[2]}"
         )
 
         await update.message.reply_text("✅ رسید دریافت شد")
