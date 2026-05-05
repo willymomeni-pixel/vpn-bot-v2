@@ -1,6 +1,5 @@
 import logging
 import asyncio
-from datetime import datetime, timedelta
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -8,7 +7,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes, ConversationHandler
+    MessageHandler, filters, ContextTypes
 )
 
 import config
@@ -20,17 +19,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── States ──────────────────────────────────────────────
-(
-    WAITING_RECEIPT,
-    WAITING_SUPPORT_MSG,
-    WAITING_TOPUP_AMOUNT,
-    WAITING_TOPUP_RECEIPT,
-    WAITING_ADMIN_BALANCE_USER,
-    WAITING_ADMIN_BALANCE_AMOUNT,
-) = range(6)
-
-# نگهداری وضعیت موقت کاربران در حافظه
+# وضعیت موقت کاربران
 user_state: dict = {}
 
 
@@ -49,13 +38,24 @@ def user_info_text(user: dict) -> str:
     return f"👤 نام: {user['full_name']}\n🔗 یوزرنیم: {uname}\n🆔 آیدی: {user['user_id']}"
 
 
-def main_menu_keyboard():
-    keyboard = [
+def get_price(key: str, default: int) -> int:
+    val = db.get_setting(f"price_{key}")
+    return int(val) if val else default
+
+
+def get_all_admins() -> list:
+    return list(set(config.ADMIN_IDS + db.get_admin_ids()))
+
+
+def main_menu_keyboard(user_id: int = None):
+    rows = [
         [KeyboardButton("🛒 خرید اشتراک"), KeyboardButton("🧪 اکانت تست")],
         [KeyboardButton("👥 زیرمجموعه‌گیری"), KeyboardButton("🎧 پشتیبانی")],
         [KeyboardButton("👤 حساب من"), KeyboardButton("💳 افزایش موجودی")],
     ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    if user_id and is_admin(user_id):
+        rows.append([KeyboardButton("🔧 پنل ادمین")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
 def admin_menu_keyboard():
@@ -64,29 +64,32 @@ def admin_menu_keyboard():
         [InlineKeyboardButton("💰 پرداخت‌های در انتظار", callback_data="admin_payments")],
         [InlineKeyboardButton("➕ افزودن ادمین", callback_data="admin_add_admin")],
         [InlineKeyboardButton("💳 تغییر موجودی کاربر", callback_data="admin_change_balance")],
+        [InlineKeyboardButton("💲 تغییر قیمت‌ها", callback_data="admin_prices")],
+        [InlineKeyboardButton("📦 افزودن کانفیگ رفرال", callback_data="admin_add_configs")],
+        [InlineKeyboardButton("📊 موجودی کانفیگ‌ها", callback_data="admin_config_count")],
+        [InlineKeyboardButton("📢 ارسال پیام همگانی", callback_data="admin_broadcast")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
-async def schedule_payment_timeout(context: ContextTypes.DEFAULT_TYPE, pay_id: int, user_id: int, chat_id: int, delay_seconds: int):
-    """بعد از تایم‌اوت، پرداخت رو لغو کنه"""
+def cancel_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_order")]])
+
+
+async def schedule_payment_timeout(bot, pay_id: int, user_id: int, chat_id: int, delay_seconds: int):
     await asyncio.sleep(delay_seconds)
     pay = db.get_payment(pay_id)
     if pay and pay["status"] == "pending":
         db.cancel_payment(pay_id)
-        # اگر اشتراک مرتبط داشت لغو کن
-        if pay.get("ref_id") and pay["purpose"] in ("subscription", "test"):
-            pass  # subscription status remains pending
+        user_state.pop(user_id, None)
         try:
-            await context.bot.send_message(
+            await bot.send_message(
                 chat_id=chat_id,
                 text="⏰ زمان پرداخت شما به پایان رسید و سفارش لغو شد.\n\nمی‌توانید مجدداً اقدام کنید.",
-                reply_markup=main_menu_keyboard()
+                reply_markup=main_menu_keyboard(user_id)
             )
         except Exception:
             pass
-        # پاک کردن وضعیت
-        user_state.pop(user_id, None)
 
 
 # ─── Start ───────────────────────────────────────────────
@@ -94,6 +97,9 @@ async def schedule_payment_timeout(context: ContextTypes.DEFAULT_TYPE, pay_id: i
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
+
+    # پاک کردن وضعیت قبلی (ریستارت)
+    user_state.pop(user.id, None)
 
     referred_by = None
     if args:
@@ -108,66 +114,92 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         referred_by=referred_by
     )
 
-    # بررسی رسیدن به آستانه رفرال
-    if referred_by:
+    # بررسی رسیدن به آستانه رفرال (فقط برای کاربر جدید)
+    if referred_by and db_user.get("_is_new"):
         ref_owner = db.get_user(referred_by)
         if ref_owner and ref_owner["referral_count"] >= config.REFERRAL_THRESHOLD and not ref_owner["referral_rewarded"]:
+            # تلاش برای ارسال کانفیگ خودکار
+            cfg = db.assign_referral_config(referred_by)
             db.mark_referral_rewarded(referred_by)
-            # پیام به ادمین
-            for admin_id in (config.ADMIN_IDS + db.get_admin_ids()):
+
+            if cfg:
+                # ارسال کانفیگ مستقیم به کاربر
                 try:
                     await context.bot.send_message(
-                        chat_id=admin_id,
-                        text=f"🎉 کاربر زیر به {config.REFERRAL_THRESHOLD} دعوت موفق رسید:\n\n"
-                             f"{user_info_text(ref_owner)}\n\n"
-                             f"لطفاً اشتراک تست برایشان ارسال کنید."
+                        chat_id=referred_by,
+                        text=f"🎊 تبریک! دعوت شما موفقیت‌آمیز بود.\n\n🎁 اشتراک تست شما:\n\n`{cfg}`",
+                        parse_mode="Markdown"
                     )
                 except Exception:
                     pass
-            # پیام به کاربر
-            try:
-                await context.bot.send_message(
-                    chat_id=referred_by,
-                    text=f"🎊 تبریک! دعوت شما موفقیت‌آمیز بود.\nاشتراک تست شما طی ساعات آینده ارسال می‌شود."
-                )
-            except Exception:
-                pass
+            else:
+                # کانفیگی موجود نیست، به ادمین اطلاع بده
+                for admin_id in get_all_admins():
+                    try:
+                        await context.bot.send_message(
+                            chat_id=admin_id,
+                            text=f"🎉 کاربر زیر به {config.REFERRAL_THRESHOLD} دعوت موفق رسید:\n\n"
+                                 f"{user_info_text(ref_owner)}\n\n"
+                                 f"⚠️ موجودی کانفیگ تمام شده! لطفاً کانفیگ ارسال کنید."
+                        )
+                    except Exception:
+                        pass
+                try:
+                    await context.bot.send_message(
+                        chat_id=referred_by,
+                        text="🎊 تبریک! دعوت شما موفقیت‌آمیز بود.\nاشتراک تست شما طی ساعات آینده ارسال می‌شود."
+                    )
+                except Exception:
+                    pass
 
     await update.message.reply_text(
         f"سلام {user.first_name} عزیز! 👋\nبه ربات خوش آمدید.",
-        reply_markup=main_menu_keyboard()
+        reply_markup=main_menu_keyboard(user.id)
     )
 
 
-# ─── Main Menu Handlers ──────────────────────────────────
+# ─── Message Handler ─────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
-
-    # بررسی وضعیت‌های انتظار
     state = user_state.get(user_id)
 
+    # اگه در وضعیت انتظار بود
     if state:
-        if state.get("waiting") == "receipt":
+        w = state.get("waiting")
+        if w == "receipt":
             await handle_receipt_photo(update, context)
             return
-        elif state.get("waiting") == "support_msg":
+        elif w == "support_msg":
             await handle_support_message(update, context)
             return
-        elif state.get("waiting") == "topup_amount":
+        elif w == "topup_amount":
             await handle_topup_amount(update, context)
             return
-        elif state.get("waiting") == "topup_receipt":
+        elif w == "topup_receipt":
             await handle_topup_receipt_photo(update, context)
             return
-        elif state.get("waiting") == "admin_bal_user":
+        elif w == "admin_bal_user":
             await handle_admin_bal_user(update, context)
             return
-        elif state.get("waiting") == "admin_bal_amount":
+        elif w == "admin_bal_amount":
             await handle_admin_bal_amount(update, context)
             return
+        elif w == "admin_set_price":
+            await handle_admin_set_price(update, context)
+            return
+        elif w == "admin_add_configs":
+            await handle_admin_add_configs(update, context)
+            return
+        elif w == "admin_broadcast":
+            await handle_admin_broadcast(update, context)
+            return
+        elif w == "admin_add_admin_id":
+            await handle_admin_add_admin_id(update, context)
+            return
 
+    # منوی اصلی
     if text == "🛒 خرید اشتراک":
         await show_subscription_plans(update, context)
     elif text == "🧪 اکانت تست":
@@ -188,9 +220,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = user_state.get(user_id)
     if state:
-        if state.get("waiting") == "receipt":
+        w = state.get("waiting")
+        if w == "receipt":
             await handle_receipt_photo(update, context)
-        elif state.get("waiting") == "topup_receipt":
+        elif w == "topup_receipt":
             await handle_topup_receipt_photo(update, context)
 
 
@@ -199,10 +232,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_subscription_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     for key, plan in config.PLANS.items():
+        price = get_price(key, plan["price"])
         keyboard.append([InlineKeyboardButton(
-            f"📦 {plan['name']} - {fmt_price(plan['price'])}",
+            f"📦 {plan['name']} - {fmt_price(price)}",
             callback_data=f"plan_{key}"
         )])
+    keyboard.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_order")])
     await update.message.reply_text(
         "📋 *پلن‌های اشتراک*\n\nیکی از پلن‌های زیر را انتخاب کنید:",
         parse_mode="Markdown",
@@ -213,10 +248,12 @@ async def show_subscription_plans(update: Update, context: ContextTypes.DEFAULT_
 async def show_test_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     for key, plan in config.TEST_PLANS.items():
+        price = get_price(key, plan["price"])
         keyboard.append([InlineKeyboardButton(
-            f"🧪 {plan['name']} - {fmt_price(plan['price'])}",
+            f"🧪 {plan['name']} - {fmt_price(price)}",
             callback_data=f"test_{key}"
         )])
+    keyboard.append([InlineKeyboardButton("❌ لغو", callback_data="cancel_order")])
     await update.message.reply_text(
         "🧪 *اکانت تست*\n\nیک پلن تست انتخاب کنید:",
         parse_mode="Markdown",
@@ -224,7 +261,7 @@ async def show_test_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─── Callback Query Handler ──────────────────────────────
+# ─── Callback Handler ────────────────────────────────────
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -236,29 +273,33 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = data.split("_", 1)[1]
         plan = config.PLANS.get(key)
         if plan:
-            await show_invoice(query, user_id, plan, key, "subscription")
+            price = get_price(key, plan["price"])
+            p = dict(plan); p["price"] = price
+            await show_invoice(query, user_id, p, key, "subscription")
 
     elif data.startswith("test_"):
         key = data.split("_", 1)[1]
         plan = config.TEST_PLANS.get(key)
         if plan:
-            await show_invoice(query, user_id, plan, key, "test")
+            price = get_price(key, plan["price"])
+            p = dict(plan); p["price"] = price
+            await show_invoice(query, user_id, p, key, "test")
 
     elif data.startswith("confirm_order_"):
         parts = data.split("_")
         order_type = parts[2]
         plan_key = parts[3]
-        await process_order_confirm(query, user_id, order_type, plan_key)
+        await process_order_confirm(query, user_id, order_type, plan_key, context)
 
     elif data.startswith("pay_wallet_"):
         parts = data.split("_")
         order_type = parts[2]
         plan_key = parts[3]
-        await process_wallet_payment(query, user_id, order_type, plan_key)
+        await process_wallet_payment(query, user_id, order_type, plan_key, context)
 
     elif data == "cancel_order":
         user_state.pop(user_id, None)
-        await query.edit_message_text("❌ سفارش لغو شد.")
+        await query.edit_message_text("❌ عملیات لغو شد.")
 
     elif data.startswith("admin_confirm_pay_"):
         pay_id = int(data.split("_")[-1])
@@ -270,24 +311,58 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "admin_users":
         await show_admin_users(query)
-
     elif data == "admin_payments":
         await show_admin_payments(query)
-
-    elif data == "admin_add_admin":
-        await query.edit_message_text("آیدی عددی کاربر مورد نظر را ارسال کنید:\n(با دستور /addadmin <user_id>)")
-
+    elif data == "admin_prices":
+        await show_admin_prices(query)
+    elif data == "admin_add_configs":
+        if not is_admin(user_id):
+            return
+        user_state[user_id] = {"waiting": "admin_add_configs"}
+        await query.edit_message_text(
+            "📦 *افزودن کانفیگ‌های رفرال*\n\n"
+            "هر کانفیگ را در یک خط جداگانه بنویسید:\n\n"
+            "مثال:\n`config1\nconfig2\nconfig3`",
+            parse_mode="Markdown"
+        )
+    elif data == "admin_config_count":
+        cnt = db.get_referral_config_count()
+        await query.edit_message_text(
+            f"📊 موجودی کانفیگ‌های رفرال: *{cnt} عدد*",
+            parse_mode="Markdown",
+            reply_markup=admin_menu_keyboard()
+        )
+    elif data == "admin_broadcast":
+        if not is_admin(user_id):
+            return
+        user_state[user_id] = {"waiting": "admin_broadcast"}
+        await query.edit_message_text(
+            "📢 *ارسال پیام همگانی*\n\nمتن پیام را بنویسید:",
+            parse_mode="Markdown"
+        )
     elif data == "admin_change_balance":
+        if not is_admin(user_id):
+            return
         user_state[user_id] = {"waiting": "admin_bal_user"}
         await query.edit_message_text("آیدی عددی کاربر را ارسال کنید:")
+    elif data == "admin_add_admin":
+        if not is_admin(user_id):
+            return
+        user_state[user_id] = {"waiting": "admin_add_admin_id"}
+        await query.edit_message_text("آیدی عددی کاربر جدید را ارسال کنید:")
 
+    elif data.startswith("set_price_"):
+        key = data.split("_", 2)[2]
+        user_state[user_id] = {"waiting": "admin_set_price", "price_key": key}
+        await query.edit_message_text(f"قیمت جدید برای `{key}` را وارد کنید (تومان):", parse_mode="Markdown")
+
+
+# ─── Invoice & Payment ───────────────────────────────────
 
 async def show_invoice(query, user_id: int, plan: dict, plan_key: str, order_type: str):
     db_user = db.get_user(user_id)
     balance = db_user["balance"] if db_user else 0
     price = plan["price"]
-
-    wallet_btn_text = f"💰 پرداخت با موجودی ({fmt_price(balance)})"
     has_enough = balance >= price
 
     text = (
@@ -299,42 +374,37 @@ async def show_invoice(query, user_id: int, plan: dict, plan_key: str, order_typ
         text += f"⏱ مدت: {plan['duration']}\n"
     text += (
         f"💵 مبلغ: *{fmt_price(price)}*\n\n"
+        f"💰 موجودی شما: {fmt_price(balance)}\n\n"
         f"روش پرداخت را انتخاب کنید:"
     )
 
+    wallet_label = f"💰 پرداخت با موجودی" + (" ✅" if has_enough else " (ناکافی)")
     keyboard = [
         [InlineKeyboardButton("💳 پرداخت با کارت", callback_data=f"confirm_order_{order_type}_{plan_key}")],
-        [InlineKeyboardButton(wallet_btn_text, callback_data=f"pay_wallet_{order_type}_{plan_key}")],
+        [InlineKeyboardButton(wallet_label, callback_data=f"pay_wallet_{order_type}_{plan_key}")],
         [InlineKeyboardButton("❌ لغو", callback_data="cancel_order")],
     ]
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-async def process_order_confirm(query, user_id: int, order_type: str, plan_key: str):
+async def process_order_confirm(query, user_id: int, order_type: str, plan_key: str, context):
     if order_type == "subscription":
         plan = config.PLANS.get(plan_key)
-        plan_name = plan["name"]
-        plan_size = plan["size"]
-        price = plan["price"]
-        purpose = "subscription"
     else:
         plan = config.TEST_PLANS.get(plan_key)
-        plan_name = plan["name"]
-        plan_size = plan["size"]
-        price = plan["price"]
-        purpose = "test"
+    if not plan:
+        return
 
-    # ایجاد رکورد اشتراک
-    sub_id = db.create_subscription(user_id, plan_key, plan_name, plan_size, price, "card")
-    # ایجاد پرداخت
-    pay_id = db.create_payment(user_id, price, purpose, sub_id)
+    price = get_price(plan_key, plan["price"])
+    sub_id = db.create_subscription(user_id, plan_key, plan["name"], plan["size"], price, "card")
+    pay_id = db.create_payment(user_id, price, order_type, sub_id)
 
     user_state[user_id] = {
         "waiting": "receipt",
         "pay_id": pay_id,
         "sub_id": sub_id,
         "price": price,
-        "plan_name": plan_name,
+        "plan_name": plan["name"],
     }
 
     text = (
@@ -345,49 +415,47 @@ async def process_order_confirm(query, user_id: int, order_type: str, plan_key: 
         f"⏰ شما *{config.PAYMENT_TIMEOUT_MINUTES} دقیقه* فرصت دارید.\n"
         f"پس از واریز، تصویر رسید را ارسال کنید."
     )
-    await query.edit_message_text(text, parse_mode="Markdown")
+    await query.edit_message_text(
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_order")]])
+    )
 
-    # زمان‌بندی لغو خودکار
     asyncio.create_task(
         schedule_payment_timeout(
-            query._bot if hasattr(query, '_bot') else None,
-            pay_id, user_id,
+            context.bot, pay_id, user_id,
             query.message.chat_id,
             config.PAYMENT_TIMEOUT_MINUTES * 60
         )
     )
 
 
-async def process_wallet_payment(query, user_id: int, order_type: str, plan_key: str):
+async def process_wallet_payment(query, user_id: int, order_type: str, plan_key: str, context):
     if order_type == "subscription":
         plan = config.PLANS.get(plan_key)
     else:
         plan = config.TEST_PLANS.get(plan_key)
+    if not plan:
+        return
 
-    price = plan["price"]
+    price = get_price(plan_key, plan["price"])
     db_user = db.get_user(user_id)
 
     if not db_user or db_user["balance"] < price:
         await query.edit_message_text(
             "❌ موجودی کافی نیست.\n\nبرای شارژ کیف پول از گزینه «افزایش موجودی» استفاده کنید.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="cancel_order")]])
+            reply_markup=cancel_keyboard()
         )
         return
 
-    # کسر موجودی
     db.update_balance(user_id, -price)
-    sub_id = db.create_subscription(
-        user_id, plan_key, plan["name"],
-        plan["size"], price, "wallet"
-    )
+    sub_id = db.create_subscription(user_id, plan_key, plan["name"], plan["size"], price, "wallet")
     pay_id = db.create_payment(user_id, price, order_type, sub_id)
     db.confirm_payment(pay_id)
 
-    # اطلاع به ادمین
     user = db.get_user(user_id)
-    for admin_id in (config.ADMIN_IDS + db.get_admin_ids()):
+    for admin_id in get_all_admins():
         try:
-            await query.get_bot().send_message(
+            await context.bot.send_message(
                 chat_id=admin_id,
                 text=(
                     f"🛍 *سفارش جدید (پرداخت با موجودی)*\n\n"
@@ -410,24 +478,21 @@ async def process_wallet_payment(query, user_id: int, order_type: str, plan_key:
     )
 
 
-# ─── Receipt Handler ─────────────────────────────────────
+# ─── Receipt ─────────────────────────────────────────────
 
 async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     state = user_state.get(user_id, {})
     pay_id = state.get("pay_id")
-    plan_name = state.get("plan_name", "")
-
     if not pay_id:
         return
 
     pay = db.get_payment(pay_id)
-    if not pay or pay["status"] not in ("pending",):
+    if not pay or pay["status"] != "pending":
         user_state.pop(user_id, None)
         await update.message.reply_text("⚠️ این سفارش منقضی یا لغو شده است.")
         return
 
-    # گرفتن فایل آیدی عکس
     if update.message.photo:
         file_id = update.message.photo[-1].file_id
     elif update.message.document:
@@ -437,35 +502,29 @@ async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     db.update_payment_receipt(pay_id, file_id)
-
     user = db.get_user(user_id)
+
     await update.message.reply_text(
         "✅ رسید شما با موفقیت دریافت شد.\nپس از تایید نهایی، اشتراک شما ارسال خواهد شد.",
-        reply_markup=main_menu_keyboard()
+        reply_markup=main_menu_keyboard(user_id)
     )
 
-    # ارسال به ادمین
-    for admin_id in (config.ADMIN_IDS + db.get_admin_ids()):
+    for admin_id in get_all_admins():
         try:
             caption = (
                 f"🧾 *رسید پرداخت جدید*\n\n"
                 f"{user_info_text(user)}\n\n"
-                f"📦 پلن: {plan_name}\n"
+                f"📦 پلن: {state.get('plan_name','')}\n"
                 f"💵 مبلغ: {fmt_price(pay['amount'])}\n"
                 f"🔖 شناسه پرداخت: #{pay_id}"
             )
-            kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ تایید", callback_data=f"admin_confirm_pay_{pay_id}"),
-                    InlineKeyboardButton("❌ رد", callback_data=f"admin_cancel_pay_{pay_id}"),
-                ]
-            ])
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ تایید", callback_data=f"admin_confirm_pay_{pay_id}"),
+                InlineKeyboardButton("❌ رد", callback_data=f"admin_cancel_pay_{pay_id}"),
+            ]])
             await context.bot.send_photo(
-                chat_id=admin_id,
-                photo=file_id,
-                caption=caption,
-                parse_mode="Markdown",
-                reply_markup=kb
+                chat_id=admin_id, photo=file_id,
+                caption=caption, parse_mode="Markdown", reply_markup=kb
             )
         except Exception as e:
             logger.error(f"Error sending receipt to admin: {e}")
@@ -541,8 +600,8 @@ async def show_referral(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 *زیرمجموعه‌گیری*\n\n"
         f"🔗 لینک اختصاصی شما:\n`{link}`\n\n"
         f"👫 تعداد دعوت‌ها: {count}\n"
-        f"🎁 برای دریافت اشتراک تست رایگان، {remaining} نفر دیگر دعوت کنید!\n\n"
-        f"هر {config.REFERRAL_THRESHOLD} دعوت موفق = یک اشتراک تست رایگان"
+        f"🎁 برای دریافت کانفیگ تست رایگان، {remaining} نفر دیگر دعوت کنید!\n\n"
+        f"هر {config.REFERRAL_THRESHOLD} دعوت موفق = یک کانفیگ تست رایگان"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -553,8 +612,9 @@ async def start_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_state[user_id] = {"waiting": "support_msg"}
     await update.message.reply_text(
-        "🎧 *پشتیبانی*\n\nپیام خود را بنویسید تا در اسرع وقت پاسخ داده شود:",
-        parse_mode="Markdown"
+        "🎧 *پشتیبانی*\n\nپیام خود را بنویسید:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_order")]])
     )
 
 
@@ -562,14 +622,14 @@ async def handle_support_message(update: Update, context: ContextTypes.DEFAULT_T
     user_id = update.effective_user.id
     user = db.get_user(user_id)
     msg = update.message.text
-
     user_state.pop(user_id, None)
+
     await update.message.reply_text(
-        "✅ پیام شما با موفقیت ارسال شد. به زودی پاسخ داده می‌شود.",
-        reply_markup=main_menu_keyboard()
+        "✅ پیام شما ارسال شد. به زودی پاسخ داده می‌شود.",
+        reply_markup=main_menu_keyboard(user_id)
     )
 
-    for admin_id in (config.ADMIN_IDS + db.get_admin_ids()):
+    for admin_id in get_all_admins():
         try:
             await context.bot.send_message(
                 chat_id=admin_id,
@@ -594,11 +654,10 @@ async def show_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     subs = db.get_user_subscriptions(user_id)
     subs_text = ""
-    if subs:
-        for s in subs[:5]:
-            status_emoji = "✅" if s["status"] == "confirmed" else "⏳"
-            subs_text += f"\n{status_emoji} {s['plan_name']} — {s['created_at'][:10]}"
-    else:
+    for s in subs[:5]:
+        emoji = "✅" if s["status"] == "confirmed" else "⏳"
+        subs_text += f"\n{emoji} {s['plan_name']} — {s['created_at'][:10]}"
+    if not subs_text:
         subs_text = "\nاشتراکی یافت نشد."
 
     text = (
@@ -618,14 +677,14 @@ async def start_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "💳 *افزایش موجودی*\n\n"
         "مبلغ مورد نظر را وارد کنید (بین ۵۰,۰۰۰ تا ۵,۰۰۰,۰۰۰ تومان):",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_order")]])
     )
 
 
 async def handle_topup_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.replace(",", "").replace("،", "").strip()
-
     try:
         amount = int(text)
     except ValueError:
@@ -649,12 +708,13 @@ async def handle_topup_amount(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"به نام: {config.CARD_HOLDER}\n\n"
         f"⏰ پس از واریز، تصویر رسید را ارسال کنید.\n"
         f"(مهلت: {config.PAYMENT_TIMEOUT_MINUTES} دقیقه)",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو", callback_data="cancel_order")]])
     )
 
     asyncio.create_task(
         schedule_payment_timeout(
-            context, pay_id, user_id,
+            context.bot, pay_id, user_id,
             update.effective_chat.id,
             config.PAYMENT_TIMEOUT_MINUTES * 60
         )
@@ -665,7 +725,6 @@ async def handle_topup_receipt_photo(update: Update, context: ContextTypes.DEFAU
     user_id = update.effective_user.id
     state = user_state.get(user_id, {})
     pay_id = state.get("pay_id")
-
     if not pay_id:
         return
 
@@ -683,10 +742,10 @@ async def handle_topup_receipt_photo(update: Update, context: ContextTypes.DEFAU
 
     await update.message.reply_text(
         "✅ رسید شما دریافت شد. پس از تایید، موجودی شما افزایش خواهد یافت.",
-        reply_markup=main_menu_keyboard()
+        reply_markup=main_menu_keyboard(user_id)
     )
 
-    for admin_id in (config.ADMIN_IDS + db.get_admin_ids()):
+    for admin_id in get_all_admins():
         try:
             caption = (
                 f"💳 *درخواست افزایش موجودی*\n\n"
@@ -694,16 +753,13 @@ async def handle_topup_receipt_photo(update: Update, context: ContextTypes.DEFAU
                 f"💵 مبلغ: {fmt_price(pay['amount'])}\n"
                 f"🔖 شناسه: #{pay_id}"
             )
-            kb = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ تایید", callback_data=f"admin_confirm_pay_{pay_id}"),
-                    InlineKeyboardButton("❌ رد", callback_data=f"admin_cancel_pay_{pay_id}"),
-                ]
-            ])
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ تایید", callback_data=f"admin_confirm_pay_{pay_id}"),
+                InlineKeyboardButton("❌ رد", callback_data=f"admin_cancel_pay_{pay_id}"),
+            ]])
             await context.bot.send_photo(
                 chat_id=admin_id, photo=file_id,
-                caption=caption, parse_mode="Markdown",
-                reply_markup=kb
+                caption=caption, parse_mode="Markdown", reply_markup=kb
             )
         except Exception:
             pass
@@ -716,7 +772,10 @@ async def handle_topup_receipt_photo(update: Update, context: ContextTypes.DEFAU
 async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    await update.message.reply_text("🔧 *پنل مدیریت*", parse_mode="Markdown", reply_markup=admin_menu_keyboard())
+    await update.message.reply_text(
+        "🔧 *پنل مدیریت*", parse_mode="Markdown",
+        reply_markup=admin_menu_keyboard()
+    )
 
 
 async def show_admin_users(query):
@@ -724,7 +783,7 @@ async def show_admin_users(query):
     text = f"👥 *کاربران ({len(users)} نفر)*\n\n"
     for u in users[:20]:
         uname = f"@{u['username']}" if u.get("username") else "—"
-        text += f"• {u['full_name']} | {uname} | موجودی: {fmt_price(u['balance'])}\n"
+        text += f"• {u['full_name']} | {uname} | {fmt_price(u['balance'])}\n"
     if len(users) > 20:
         text += f"\n... و {len(users)-20} نفر دیگر"
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
@@ -742,6 +801,78 @@ async def show_admin_payments(query):
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=admin_menu_keyboard())
 
 
+async def show_admin_prices(query):
+    lines = ""
+    for key, plan in {**config.PLANS, **config.TEST_PLANS}.items():
+        price = get_price(key, plan["price"])
+        lines += f"• {plan['name']}: {fmt_price(price)}\n"
+
+    kb = []
+    for key, plan in {**config.PLANS, **config.TEST_PLANS}.items():
+        kb.append([InlineKeyboardButton(f"✏️ {plan['name']}", callback_data=f"set_price_{key}")])
+    kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data="admin_back")])
+
+    await query.edit_message_text(
+        f"💲 *قیمت‌های فعلی*\n\n{lines}\nروی هر پلن بزنید تا قیمتش را تغییر دهید:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+
+async def handle_admin_set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = user_state.get(user_id, {})
+    key = state.get("price_key")
+    try:
+        price = int(update.message.text.strip().replace(",", "").replace("،", ""))
+        db.set_setting(f"price_{key}", str(price))
+        user_state.pop(user_id, None)
+        await update.message.reply_text(
+            f"✅ قیمت با موفقیت تغییر کرد.\n{key}: {fmt_price(price)}",
+            reply_markup=main_menu_keyboard(user_id)
+        )
+    except ValueError:
+        await update.message.reply_text("⚠️ لطفاً یک عدد صحیح وارد کنید.")
+
+
+async def handle_admin_add_configs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    configs = [line.strip() for line in text.split("\n") if line.strip()]
+    if not configs:
+        await update.message.reply_text("⚠️ هیچ کانفیگی یافت نشد.")
+        return
+    db.add_referral_configs(configs)
+    user_state.pop(user_id, None)
+    cnt = db.get_referral_config_count()
+    await update.message.reply_text(
+        f"✅ {len(configs)} کانفیگ اضافه شد.\n📊 موجودی کل: {cnt} عدد",
+        reply_markup=main_menu_keyboard(user_id)
+    )
+
+
+async def handle_admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    user_state.pop(user_id, None)
+
+    all_ids = db.get_all_user_ids()
+    sent = 0
+    failed = 0
+    for uid in all_ids:
+        try:
+            await context.bot.send_message(chat_id=uid, text=f"📢 *پیام ادمین:*\n\n{text}", parse_mode="Markdown")
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)  # جلوگیری از flood
+
+    await update.message.reply_text(
+        f"📢 پیام همگانی ارسال شد.\n✅ موفق: {sent}\n❌ ناموفق: {failed}",
+        reply_markup=main_menu_keyboard(user_id)
+    )
+
+
 async def handle_admin_bal_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     try:
@@ -753,7 +884,7 @@ async def handle_admin_bal_user(update: Update, context: ContextTypes.DEFAULT_TY
         user_state[user_id] = {"waiting": "admin_bal_amount", "target_id": target_id}
         await update.message.reply_text(
             f"کاربر: {target['full_name']}\nموجودی فعلی: {fmt_price(target['balance'])}\n\n"
-            f"موجودی جدید را وارد کنید (عدد مثبت = افزایش، منفی = کاهش):"
+            f"مقدار تغییر را وارد کنید (مثبت = افزایش، منفی = کاهش):"
         )
     except ValueError:
         await update.message.reply_text("⚠️ لطفاً آیدی عددی وارد کنید.")
@@ -769,8 +900,8 @@ async def handle_admin_bal_amount(update: Update, context: ContextTypes.DEFAULT_
         target = db.get_user(target_id)
         user_state.pop(user_id, None)
         await update.message.reply_text(
-            f"✅ موجودی کاربر به‌روز شد.\nموجودی جدید: {fmt_price(target['balance'])}",
-            reply_markup=main_menu_keyboard()
+            f"✅ موجودی به‌روز شد.\nموجودی جدید: {fmt_price(target['balance'])}",
+            reply_markup=main_menu_keyboard(user_id)
         )
         try:
             await context.bot.send_message(
@@ -783,6 +914,20 @@ async def handle_admin_bal_amount(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("⚠️ لطفاً یک عدد وارد کنید.")
 
 
+async def handle_admin_add_admin_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    try:
+        new_id = int(update.message.text.strip())
+        db.add_admin(new_id)
+        user_state.pop(user_id, None)
+        await update.message.reply_text(
+            f"✅ کاربر {new_id} به عنوان ادمین اضافه شد.",
+            reply_markup=main_menu_keyboard(user_id)
+        )
+    except ValueError:
+        await update.message.reply_text("⚠️ آیدی باید عدد باشد.")
+
+
 # ─── Admin Commands ──────────────────────────────────────
 
 async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -792,9 +937,8 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("استفاده: /addadmin <user_id>")
         return
     try:
-        new_admin_id = int(context.args[0])
-        db.add_admin(new_admin_id)
-        await update.message.reply_text(f"✅ کاربر {new_admin_id} به عنوان ادمین اضافه شد.")
+        db.add_admin(int(context.args[0]))
+        await update.message.reply_text(f"✅ ادمین {context.args[0]} اضافه شد.")
     except ValueError:
         await update.message.reply_text("⚠️ آیدی باید عدد باشد.")
 
@@ -806,9 +950,8 @@ async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("استفاده: /removeadmin <user_id>")
         return
     try:
-        rem_id = int(context.args[0])
-        db.remove_admin(rem_id)
-        await update.message.reply_text(f"✅ ادمین {rem_id} حذف شد.")
+        db.remove_admin(int(context.args[0]))
+        await update.message.reply_text(f"✅ ادمین {context.args[0]} حذف شد.")
     except ValueError:
         await update.message.reply_text("⚠️ آیدی باید عدد باشد.")
 
@@ -820,10 +963,8 @@ async def cmd_setbalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("استفاده: /setbalance <user_id> <amount>")
         return
     try:
-        uid = int(context.args[0])
-        amount = int(context.args[1])
-        db.set_balance(uid, amount)
-        await update.message.reply_text(f"✅ موجودی کاربر {uid} به {fmt_price(amount)} تنظیم شد.")
+        db.set_balance(int(context.args[0]), int(context.args[1]))
+        await update.message.reply_text("✅ موجودی تنظیم شد.")
     except ValueError:
         await update.message.reply_text("⚠️ مقادیر نامعتبر.")
 
@@ -837,8 +978,6 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     db.init_db()
-
-    # اضافه کردن ادمین‌های پیش‌فرض به دیتابیس
     for admin_id in config.ADMIN_IDS:
         db.add_admin(admin_id)
 
@@ -849,13 +988,11 @@ def main():
     app.add_handler(CommandHandler("addadmin", cmd_addadmin))
     app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
     app.add_handler(CommandHandler("setbalance", cmd_setbalance))
-
     app.add_handler(CallbackQueryHandler(callback_handler))
-
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Bot is starting...")
+    logger.info("Bot started.")
     app.run_polling(drop_pending_updates=True)
 
 
