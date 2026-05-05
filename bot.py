@@ -1,30 +1,14 @@
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 
 from config import TOKEN
-from handlers import start, handler, photo
+from handlers import start, handler, photo, text_handler
 
+app = ApplicationBuilder().token(TOKEN).build()
 
-def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CallbackQueryHandler(handler))
+app.add_handler(MessageHandler(filters.PHOTO, photo))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    # /start
-    app.add_handler(CommandHandler("start", start))
-
-    # دکمه‌ها
-    app.add_handler(CallbackQueryHandler(handler))
-
-    # رسید پرداخت (عکس)
-    app.add_handler(MessageHandler(filters.PHOTO, photo))
-
-    print("Bot is running...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+print("BOT RUNNING...")
+app.run_polling()
