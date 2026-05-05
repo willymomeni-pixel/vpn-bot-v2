@@ -7,7 +7,6 @@ cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
     balance INTEGER DEFAULT 0,
-    ref_by INTEGER,
     ref_count INTEGER DEFAULT 0
 )
 """)
@@ -18,9 +17,7 @@ CREATE TABLE IF NOT EXISTS orders (
     user_id INTEGER,
     plan TEXT,
     price INTEGER,
-    type TEXT,
-    status TEXT,
-    expire INTEGER
+    status TEXT
 )
 """)
 
@@ -29,41 +26,29 @@ db.commit()
 
 def get_user(uid):
     cur.execute("SELECT * FROM users WHERE id=?", (uid,))
-    u = cur.fetchone()
-    if not u:
+    user = cur.fetchone()
+    if not user:
         cur.execute("INSERT INTO users (id) VALUES (?)", (uid,))
         db.commit()
-        return (uid, 0, None, 0)
-    return u
+        return (uid, 0, 0)
+    return user
 
 
-def set_ref(user, ref):
-    if ref:
-        cur.execute("UPDATE users SET ref_by=? WHERE id=?", (ref, user))
-        cur.execute("UPDATE users SET ref_count = ref_count + 1 WHERE id=?", (ref,))
-        db.commit()
-
-
-def add_order(uid, plan, price, t):
+def add_order(uid, plan, price):
     cur.execute(
-        "INSERT INTO orders (user_id, plan, price, type, status, expire) VALUES (?,?,?,?,?,?)",
-        (uid, plan, price, t, "pending", 0)
+        "INSERT INTO orders (user_id, plan, price, status) VALUES (?,?,?,?)",
+        (uid, plan, price, "pending")
     )
     db.commit()
 
 
-def last_order(uid):
-    cur.execute("SELECT * FROM orders WHERE user_id=? AND status='pending' ORDER BY id DESC LIMIT 1", (uid,))
+def get_last_order(uid):
+    cur.execute("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 1", (uid,))
     return cur.fetchone()
 
 
-def pay(uid):
+def pay_order(uid):
     cur.execute("UPDATE orders SET status='paid' WHERE user_id=? AND status='pending'", (uid,))
-    db.commit()
-
-
-def set_expire(uid, exp):
-    cur.execute("UPDATE orders SET expire=? WHERE user_id=? AND status='pending'", (exp, uid))
     db.commit()
 
 
@@ -72,6 +57,6 @@ def add_balance(uid, amount):
     db.commit()
 
 
-def use_balance(uid, amount):
+def minus_balance(uid, amount):
     cur.execute("UPDATE users SET balance = balance - ? WHERE id=?", (amount, uid))
     db.commit()
