@@ -64,6 +64,14 @@ def is_sales_open() -> bool:
     val = db.get_setting("sales_open")
     return val != "0"
 
+def is_card_payment_open() -> bool:
+    val = db.get_setting("card_payment_open")
+    return val != "0"
+
+def is_topup_open() -> bool:
+    val = db.get_setting("topup_open")
+    return val != "0"
+
 
 def main_menu_keyboard(user_id: int = None):
     rows = [
@@ -78,6 +86,8 @@ def main_menu_keyboard(user_id: int = None):
 
 def admin_menu_keyboard():
     sales_status = "🟢 فروش باز است" if is_sales_open() else "🔴 فروش بسته است"
+    card_status = "🟢 پرداخت کارت باز" if is_card_payment_open() else "🔴 پرداخت کارت بسته"
+    topup_status = "🟢 افزایش موجودی باز" if is_topup_open() else "🔴 افزایش موجودی بسته"
     keyboard = [
         [InlineKeyboardButton("👥 لیست کاربران", callback_data="admin_users")],
         [InlineKeyboardButton("💰 پرداخت‌های در انتظار", callback_data="admin_payments")],
@@ -88,6 +98,8 @@ def admin_menu_keyboard():
         [InlineKeyboardButton("💰 تغییر موجودی کاربر", callback_data="admin_change_balance")],
         [InlineKeyboardButton("📢 ارسال پیام همگانی", callback_data="admin_broadcast")],
         [InlineKeyboardButton(f"{sales_status} — تغییر", callback_data="admin_toggle_sales")],
+        [InlineKeyboardButton(f"{card_status} — تغییر", callback_data="admin_toggle_card")],
+        [InlineKeyboardButton(f"{topup_status} — تغییر", callback_data="admin_toggle_topup")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -431,6 +443,30 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_to_admin()
         )
 
+    elif data == "admin_toggle_card":
+        if not is_admin(user_id):
+            return
+        current = is_card_payment_open()
+        db.set_setting("card_payment_open", "0" if current else "1")
+        status = "🟢 باز" if not current else "🔴 بسته"
+        await query.edit_message_text(
+            f"✅ پرداخت کارت به کارت به *{status}* تغییر کرد.",
+            parse_mode="Markdown",
+            reply_markup=back_to_admin()
+        )
+
+    elif data == "admin_toggle_topup":
+        if not is_admin(user_id):
+            return
+        current = is_topup_open()
+        db.set_setting("topup_open", "0" if current else "1")
+        status = "🟢 باز" if not current else "🔴 بسته"
+        await query.edit_message_text(
+            f"✅ افزایش موجودی به *{status}* تغییر کرد.",
+            parse_mode="Markdown",
+            reply_markup=back_to_admin()
+        )
+
 
 # ─── Invoice ─────────────────────────────────────────────
 
@@ -473,6 +509,13 @@ async def process_order_confirm(query, user_id: int, order_type: str, plan_key: 
     if db.get_config_count(plan_key) == 0:
         await query.edit_message_text(
             "⚠️ متأسفانه این پلن در حال حاضر موجود نیست.\nلطفاً بعداً مراجعه کنید.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ بستن", callback_data="cancel_order")]])
+        )
+        return
+
+    if not is_card_payment_open():
+        await query.edit_message_text(
+            "🔴 پرداخت کارت به کارت غیرفعال است. از پرداخت با موجودی استفاده کنید.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ بستن", callback_data="cancel_order")]])
         )
         return
@@ -593,6 +636,7 @@ async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("لطفاً تصویر رسید را به صورت عکس ارسال کنید.")
         return
 
+    is_document = bool(update.message.document)
     db.update_payment_receipt(pay_id, file_id)
     user = db.get_user(user_id)
 
@@ -621,10 +665,16 @@ async def handle_receipt_photo(update: Update, context: ContextTypes.DEFAULT_TYP
                 ],
                 [InlineKeyboardButton("✉️ پیام مستقیم", callback_data=f"admin_msg_user_{user_id}")]
             ])
-            await context.bot.send_photo(
-                chat_id=admin_id, photo=file_id,
-                caption=caption, parse_mode="Markdown", reply_markup=kb
-            )
+            if is_document:
+                await context.bot.send_document(
+                    chat_id=admin_id, document=file_id,
+                    caption=caption, parse_mode="Markdown", reply_markup=kb
+                )
+            else:
+                await context.bot.send_photo(
+                    chat_id=admin_id, photo=file_id,
+                    caption=caption, parse_mode="Markdown", reply_markup=kb
+                )
         except Exception as e:
             logger.error(f"Error sending receipt to admin: {e}")
 
@@ -808,6 +858,9 @@ async def show_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    if not is_topup_open():
+        await update.message.reply_text("🔴 افزایش موجودی در حال حاضر غیرفعال است.")
+        return
     user_state[user_id] = {"waiting": "topup_amount"}
     await update.message.reply_text(
         "💳 *افزایش موجودی*\n\nمبلغ مورد نظر را وارد کنید (۵۰,۰۰۰ تا ۵,۰۰۰,۰۰۰ تومان):",
