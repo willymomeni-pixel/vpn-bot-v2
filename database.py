@@ -71,13 +71,15 @@ def init_db():
         )
     """)
 
+    # کانفیگ‌ها با نوع پلن جداگانه
     c.execute("""
-        CREATE TABLE IF NOT EXISTS referral_configs (
-            id      INTEGER PRIMARY KEY AUTOINCREMENT,
-            config  TEXT NOT NULL,
-            is_used INTEGER DEFAULT 0,
-            used_by INTEGER,
-            used_at TEXT
+        CREATE TABLE IF NOT EXISTS configs (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_key TEXT NOT NULL,
+            config   TEXT NOT NULL,
+            is_used  INTEGER DEFAULT 0,
+            used_by  INTEGER,
+            used_at  TEXT
         )
     """)
 
@@ -122,18 +124,12 @@ def get_or_create_user(user_id: int, username: str, full_name: str, referred_by:
         conn.commit()
         is_new = True
         if referred_by:
-            c.execute(
-                "UPDATE users SET referral_count=referral_count+1 WHERE user_id=?",
-                (referred_by,)
-            )
+            c.execute("UPDATE users SET referral_count=referral_count+1 WHERE user_id=?", (referred_by,))
             conn.commit()
         c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
         row = c.fetchone()
     else:
-        c.execute(
-            "UPDATE users SET username=?,full_name=? WHERE user_id=?",
-            (username, full_name, user_id)
-        )
+        c.execute("UPDATE users SET username=?,full_name=? WHERE user_id=?", (username, full_name, user_id))
         conn.commit()
     result = dict(row)
     conn.close()
@@ -216,13 +212,19 @@ def create_subscription(user_id, plan_key, plan_name, plan_size, price, paid_wit
     return sub_id
 
 
+def get_subscription(sub_id: int):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT * FROM subscriptions WHERE id=?", (sub_id,))
+    row = c.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def confirm_subscription(sub_id: int):
     conn = get_conn()
     c = conn.cursor()
-    c.execute(
-        "UPDATE subscriptions SET status='confirmed',confirmed_at=datetime('now') WHERE id=?",
-        (sub_id,)
-    )
+    c.execute("UPDATE subscriptions SET status='confirmed',confirmed_at=datetime('now') WHERE id=?", (sub_id,))
     conn.commit()
     conn.close()
 
@@ -254,10 +256,7 @@ def create_payment(user_id, amount, purpose, ref_id=None):
 def update_payment_receipt(pay_id, file_id):
     conn = get_conn()
     c = conn.cursor()
-    c.execute(
-        "UPDATE payments SET receipt_file_id=?,status='receipt_received' WHERE id=?",
-        (file_id, pay_id)
-    )
+    c.execute("UPDATE payments SET receipt_file_id=?,status='receipt_received' WHERE id=?", (file_id, pay_id))
     conn.commit()
     conn.close()
 
@@ -265,10 +264,7 @@ def update_payment_receipt(pay_id, file_id):
 def confirm_payment(pay_id):
     conn = get_conn()
     c = conn.cursor()
-    c.execute(
-        "UPDATE payments SET status='confirmed',confirmed_at=datetime('now') WHERE id=?",
-        (pay_id,)
-    )
+    c.execute("UPDATE payments SET status='confirmed',confirmed_at=datetime('now') WHERE id=?", (pay_id,))
     conn.commit()
     conn.close()
 
@@ -331,38 +327,56 @@ def get_admin_ids():
     return rows
 
 
-# ─── Referral Configs ─────────────────────────────────────
+# ─── Configs ─────────────────────────────────────────────
 
-def add_referral_configs(configs: list):
+def add_configs(plan_key: str, configs: list):
     conn = get_conn()
     c = conn.cursor()
     for cfg in configs:
-        c.execute("INSERT INTO referral_configs (config) VALUES (?)", (cfg.strip(),))
+        if cfg.strip():
+            c.execute("INSERT INTO configs (plan_key,config) VALUES (?,?)", (plan_key, cfg.strip()))
     conn.commit()
     conn.close()
 
 
-def get_referral_config_count():
+def get_config_count(plan_key: str = None):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT COUNT(*) as cnt FROM referral_configs WHERE is_used=0")
+    if plan_key:
+        c.execute("SELECT COUNT(*) as cnt FROM configs WHERE plan_key=? AND is_used=0", (plan_key,))
+    else:
+        c.execute("SELECT COUNT(*) as cnt FROM configs WHERE is_used=0")
     row = c.fetchone()
     conn.close()
     return row["cnt"] if row else 0
 
 
-def assign_referral_config(user_id: int):
+def assign_config(plan_key: str, user_id: int):
     conn = get_conn()
     c = conn.cursor()
-    c.execute("SELECT * FROM referral_configs WHERE is_used=0 ORDER BY id ASC LIMIT 1")
+    c.execute("SELECT * FROM configs WHERE plan_key=? AND is_used=0 ORDER BY id ASC LIMIT 1", (plan_key,))
     row = c.fetchone()
     if not row:
         conn.close()
         return None
     c.execute(
-        "UPDATE referral_configs SET is_used=1,used_by=?,used_at=datetime('now') WHERE id=?",
+        "UPDATE configs SET is_used=1,used_by=?,used_at=datetime('now') WHERE id=?",
         (user_id, row["id"])
     )
     conn.commit()
     conn.close()
     return row["config"]
+
+
+def get_configs_summary():
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
+        SELECT plan_key,
+               SUM(CASE WHEN is_used=0 THEN 1 ELSE 0 END) as available,
+               COUNT(*) as total
+        FROM configs GROUP BY plan_key
+    """)
+    rows = [dict(r) for r in c.fetchall()]
+    conn.close()
+    return rows
